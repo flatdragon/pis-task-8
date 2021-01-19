@@ -1,0 +1,130 @@
+name: Main Workflow
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+
+env:
+  HEROKU_API_KEY: ${{ secrets.HEROKU_API_KEY }}
+  HEROKU_APP: ${{ secrets.HEROKU_APP }}
+  REPO: ${{ github.repository }}
+  SHA: $(echo "${{ github.sha }}" | cut -c1-7)
+
+jobs:
+  test-app:
+    name: Test App
+
+    runs-on: ${{ matrix.os }}
+
+    strategy:
+      matrix:
+        os: [ubuntu-20.04]
+        node: [14]
+
+    steps:
+      - name: Checkout Last Branch Commit 🔍
+        uses: actions/checkout@v2
+      
+      - name: Setup Node Env 🔧
+        uses: actions/setup-node@v2.1.2
+        with:
+          node-version: ${{ matrix.node }}
+
+      - name: Cache Dependencies 📦
+        uses: actions/cache@v2
+        with:
+          path: ~/.npm
+          key: ${{ runner.os }}-node-${{ hashFiles('**/package-lock.json') }}
+          restore-keys: |
+            ${{ runner.os }}-node-
+
+      - name: Install Dependencies 💿
+        run: npm ci
+
+      - name: Run Lint 👀
+        run: npm run lint
+
+      - name: Run Test 🧪
+        run: npm run test
+  
+  deploy-app:
+    name: Deploy App to Heroku
+
+    if: github.ref == 'refs/heads/main'
+
+    runs-on: ubuntu-20.04
+
+    needs:
+      - test-app
+        
+    env:
+      HEROKU_APP: ${{ secrets.HEROKU_APP }}
+      APP_PATH: sources
+    
+    steps:
+      - name: Checkout Last Branch Commit 🔍
+        uses: actions/checkout@v2
+        with:
+          path: sources
+
+      - name: Login to Heroku 🔑
+        run: heroku container:login
+      
+      - name: Create App at Heroku 🔨 (❔ Conditionally ❔)
+        run: |
+          if [ -z "$(heroku apps:info --shell)" ]
+          then
+            echo "App doesn't exists. Start creating..."
+            heroku apps:create ${HEROKU_APP} --region eu
+            heroku buildpacks:add heroku/nodejs
+            echo "App is successfully created. Going to the next step..."
+          else
+            echo "App exists. Going to the next step..."
+          fi
+
+      - name: Create Temporary Directory for Deployment 📂
+        run: mkdir deployment
+
+      - name: Connect to Heroku Git 🔌
+        run: |
+          cd deployment
+          git init
+          git config user.name github-actions
+          git config user.email github-actions@github.com
+          git remote add heroku https://heroku:${HEROKU_API_KEY}@git.heroku.com/${HEROKU_APP}.git
+
+      - name: Enter Maintenance Mode at Heroku 🚧❌
+        run: heroku maintenance:on
+
+      - name: Set App Env Variables 🔧
+        run: |
+          heroku config:set NPM_CONFIG_PRODUCTION=false
+          heroku config:set HOST=0.0.0.0
+          heroku config:set NODE_ENV=production
+
+      - name: Push App Changes to Heroku 🚀
+        run: |
+          cd deployment
+          
+          if [ ! -z "$(git ls-remote --heads heroku master)" ]
+          then
+            git pull --ff-only heroku master
+          fi
+
+          rsync -av --progress ../${APP_PATH}/. . --exclude .git
+
+          if [ -z "$(git status --porcelain)" ]
+          then
+            echo "App is up to date. Going to the next step..."
+          else
+            git add .
+            git commit -m "deploy app from https://github.com/${REPO}/tree/${SHA}"
+            git push heroku master
+          fi
+
+      - name: Leave Maintenance Mode at Heroku 🚧✔️
+        run: heroku maintenance:off
